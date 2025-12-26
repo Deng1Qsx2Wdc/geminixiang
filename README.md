@@ -14,6 +14,8 @@
 
 ## 🚀 快速开始
 
+> 📖 **服务器部署指南**：查看 [DEPLOY.md](DEPLOY.md) 了解详细的服务器部署步骤
+
 ### 1. 安装依赖
 
 ```bash
@@ -31,15 +33,28 @@ python server.py
 ╔══════════════════════════════════════════════════════════╗
 ║           Gemini OpenAI Compatible API Server            ║
 ╠══════════════════════════════════════════════════════════╣
-║  后台配置: http://localhost:8000/admin                   ║
-║  API 地址: http://localhost:8000/v1                      ║
+║  本地访问:                                                ║
+║    后台配置: http://localhost:8001/admin                   ║
+║    API 地址: http://localhost:8001/v1                      ║
+║                                                           ║
+║  外部访问（手机/其他设备）:                                ║
+║    后台配置: http://服务器IP:8001/admin                   ║
+║    API 地址: http://服务器IP:8001/v1                      ║
+║                                                           ║
 ║  API Key:  sk-gemini                                     ║
 ╚══════════════════════════════════════════════════════════╝
 ```
 
+> 💡 **手机访问提示**：
+> - 确保手机和服务器在同一局域网（WiFi）下
+> - 使用服务器显示的 IP 地址访问（不是 localhost）
+> - 如果无法访问，检查服务器防火墙是否开放了 8001 端口
+
 ### 3. 配置 Cookie
 
-1. 打开 http://localhost:8000/admin
+1. 打开后台配置页面：
+   - 本地访问：http://localhost:8001/admin
+   - 手机访问：http://服务器IP:8001/admin
 2. 使用默认账号登录：
    - 用户名: `admin`
    - 密码: `admin123`
@@ -57,7 +72,7 @@ python server.py
 from openai import OpenAI
 
 client = OpenAI(
-    base_url="http://localhost:8000/v1",
+    base_url="http://服务器IP:8001/v1",  # 或使用 localhost:8001
     api_key="sk-gemini"
 )
 
@@ -72,10 +87,11 @@ print(response.choices[0].message.content)
 
 | 项目 | 值 |
 |------|-----|
-| Base URL | `http://localhost:8000/v1` |
+| Base URL | `http://服务器IP:8001/v1` 或 `http://localhost:8001/v1` |
 | API Key | `sk-gemini` |
-| 后台地址 | `http://localhost:8000/admin` |
+| 后台地址 | `http://服务器IP:8001/admin` 或 `http://localhost:8001/admin` |
 | 登录账号 | `admin` / `admin123` |
+| 端口 | `8001` |
 
 ### 可用模型
 
@@ -88,7 +104,7 @@ print(response.choices[0].message.content)
 ```python
 from openai import OpenAI
 
-client = OpenAI(base_url="http://localhost:8000/v1", api_key="sk-gemini")
+client = OpenAI(base_url="http://服务器IP:8001/v1", api_key="sk-gemini")
 
 messages = []
 
@@ -114,7 +130,7 @@ print(f"助手: {response.choices[0].message.content}")
 import base64
 from openai import OpenAI
 
-client = OpenAI(base_url="http://localhost:8000/v1", api_key="sk-gemini")
+client = OpenAI(base_url="http://服务器IP:8001/v1", api_key="sk-gemini")
 
 # 读取本地图片
 with open("image.png", "rb") as f:
@@ -153,7 +169,7 @@ response = client.chat.completions.create(
 ```python
 from openai import OpenAI
 
-client = OpenAI(base_url="http://localhost:8000/v1", api_key="sk-gemini")
+client = OpenAI(base_url="http://服务器IP:8001/v1", api_key="sk-gemini")
 
 stream = client.chat.completions.create(
     model="gemini-3.0-flash",
@@ -214,8 +230,28 @@ API_KEY = "your-api-key"
 ### 修改端口
 
 ```python
-PORT = 8000
+PORT = 8001  # 默认 8001
 ```
+
+### 服务器部署（手机访问）
+
+1. **确保服务器绑定到所有网络接口**（已默认配置）：
+   ```python
+   HOST = "0.0.0.0"  # 允许外部访问
+   ```
+
+2. **开放防火墙端口**：
+   - Windows: 在防火墙设置中允许 8001 端口
+   - Linux: `sudo ufw allow 8001` 或 `sudo firewall-cmd --add-port=8001/tcp`
+
+3. **手机访问**：
+   - 确保手机和服务器在同一 WiFi 网络
+   - 使用服务器 IP 地址访问（启动时会显示）
+   - 例如：`http://192.168.1.100:8001/admin`
+
+4. **获取服务器 IP**：
+   - Windows: `ipconfig` 查看 IPv4 地址
+   - Linux/Mac: `ifconfig` 或 `ip addr` 查看 IP 地址
 
 ## ❓ 常见问题
 

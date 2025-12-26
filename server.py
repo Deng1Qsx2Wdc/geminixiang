@@ -2,8 +2,12 @@
 Gemini OpenAI 兼容 API 服务
 
 启动: python server.py
-后台: http://localhost:8000/admin
-API:  http://localhost:8000/v1
+本地访问:
+  后台: http://localhost:8001/admin
+  API:  http://localhost:8001/v1
+外部访问（手机/其他设备）:
+  后台: http://服务器IP:8001/admin
+  API:  http://服务器IP:8001/v1
 """
 
 from fastapi import FastAPI, HTTPException, Header, Request
@@ -24,7 +28,7 @@ import secrets
 # ============ 配置 ============
 API_KEY = "sk-gemini"
 HOST = "0.0.0.0"
-PORT = 8000
+PORT = 8001
 CONFIG_FILE = "config_data.json"
 # 后台登录账号密码
 ADMIN_USERNAME = "admin"
@@ -246,7 +250,7 @@ def get_client():
         snlm0e=_config["SNLM0E"],
         cookies_str=cookies,
         push_id=_config.get("PUSH_ID") or None,
-        debug=False,
+        debug=True,  # 启用调试模式以查看响应格式
     )
     return _client
 
@@ -415,12 +419,7 @@ def get_admin_html():
                 <h3>📡 API 调用信息</h3>
                 <p>Base URL: <strong id="baseUrl"></strong></p>
                 <p>API Key: <strong id="apiKey"></strong></p>
-<pre>from openai import OpenAI
-client = OpenAI(base_url="<span id="codeUrl"></span>", api_key="<span id="codeKey"></span>")
-response = client.chat.completions.create(
-    model="gemini",
-    messages=[{"role": "user", "content": "你好"}]
-)</pre>
+                <p style="margin-top: 10px; font-size: 12px; color: #666;">💡 服务器地址: <strong id="serverIp"></strong></p>
             </div>
         </div>
     </div>
@@ -429,10 +428,27 @@ response = client.chat.completions.create(
         const API_KEY = "''' + API_KEY + '''";
         const PORT = ''' + str(PORT) + ''';
         
-        document.getElementById('baseUrl').textContent = 'http://localhost:' + PORT + '/v1';
+        // 动态获取当前访问地址（支持手机访问）
+        const currentHost = window.location.hostname;
+        const currentPort = window.location.port || PORT;
+        const baseUrl = window.location.protocol + '//' + currentHost + (currentPort ? ':' + currentPort : '') + '/v1';
+        
+        document.getElementById('baseUrl').textContent = baseUrl;
         document.getElementById('apiKey').textContent = API_KEY;
-        document.getElementById('codeUrl').textContent = 'http://localhost:' + PORT + '/v1';
-        document.getElementById('codeKey').textContent = API_KEY;
+        
+        // 获取服务器IP地址
+        fetch('/admin/server-info')
+            .then(r => r.json())
+            .then(data => {
+                if (data.server_ip && data.server_ip !== '127.0.0.1' && data.server_ip !== 'localhost') {
+                    document.getElementById('serverIp').textContent = data.server_ip + ':' + PORT;
+                } else {
+                    document.getElementById('serverIp').textContent = currentHost + ':' + currentPort;
+                }
+            })
+            .catch(() => {
+                document.getElementById('serverIp').textContent = currentHost + ':' + currentPort;
+            });
         
         // Cookie 字段映射
         const cookieFields = {
@@ -793,18 +809,33 @@ def is_continuation(current_messages: list, last_hash: str) -> bool:
     """
     判断当前请求是否是上一次对话的延续
     
-    逻辑：如果当前消息去掉最后一条用户消息后的 hash 等于上次的 hash，
-    说明是同一对话的延续
+    逻辑：
+    1. 如果消息列表中有 assistant 的回复，说明是延续对话
+    2. 或者如果消息数量 > 1，也认为是延续对话
+    3. 否则检查 hash 是否匹配
     """
     if not last_hash:
         return False
+    
+    # 检查是否有 assistant 的回复（说明是延续对话）
+    has_assistant = any(
+        (m.role if hasattr(m, 'role') else m.get('role', '')) == "assistant"
+        for m in current_messages
+    )
+    
+    if has_assistant:
+        return True
+    
+    # 如果消息数量 > 1，也认为是延续对话
+    if len(current_messages) > 1:
+        return True
     
     # 找到所有用户消息
     user_indices = [i for i, m in enumerate(current_messages) 
                     if (m.role if hasattr(m, 'role') else m.get('role', '')) == "user"]
     
     if len(user_indices) <= 1:
-        # 只有一条用户消息，无法判断是否延续，视为新对话
+        # 只有一条用户消息，且没有 assistant 回复，视为新对话
         return False
     
     # 去掉最后一条用户消息，计算剩余消息的 hash
@@ -850,9 +881,28 @@ async def chat_completions(request: ChatCompletionRequest, authorization: str = 
         client = get_client()
         
         # 判断是否需要重置会话
-        # 如果不是上一次对话的延续，则重置
-        if not is_continuation(request.messages, _last_user_messages_hash):
+        # 关键：Gemini 通过 conversation_id 等维护上下文，不应该轻易重置
+        # 只有在明确是新对话时才重置（第一条消息且没有 conversation_id）
+        has_assistant = any(
+            (m.role if hasattr(m, 'role') else m.get('role', '')) == "assistant"
+            for m in request.messages
+        )
+        
+        # 只有在以下情况才重置：
+        # 1. 只有一条用户消息
+        # 2. 没有 assistant 回复
+        # 3. client 的 conversation_id 为空（说明是新对话）
+        # 4. 不是延续对话
+        should_reset = (
+            len(request.messages) == 1 and 
+            not has_assistant and 
+            not client.conversation_id and
+            not is_continuation(request.messages, _last_user_messages_hash)
+        )
+        
+        if should_reset:
             client.reset()
+        # 其他情况都保持上下文，不重置
         
         # 处理消息，支持 OpenAI 格式的图片 (base64)
         messages = []
@@ -970,15 +1020,51 @@ async def reset_context(authorization: str = Header(None)):
     return {"status": "ok"}
 
 
+@app.get("/admin/server-info")
+async def get_server_info(request: Request):
+    """获取服务器信息"""
+    if not verify_admin_session(request):
+        raise HTTPException(status_code=401, detail="未登录")
+    import socket
+    try:
+        s = socket.socket(socket.AF_INET, socket.SOCK_DGRAM)
+        s.connect(("8.8.8.8", 80))
+        server_ip = s.getsockname()[0]
+        s.close()
+    except:
+        server_ip = "127.0.0.1"
+    return {"server_ip": server_ip, "port": PORT}
+
+
 load_config()
 
 if __name__ == "__main__":
+    import socket
+    # 获取本机 IP 地址
+    def get_local_ip():
+        try:
+            s = socket.socket(socket.AF_INET, socket.SOCK_DGRAM)
+            s.connect(("8.8.8.8", 80))
+            ip = s.getsockname()[0]
+            s.close()
+            return ip
+        except:
+            return "服务器IP"
+    
+    local_ip = get_local_ip()
+    
     print(f"""
 ╔══════════════════════════════════════════════════════════╗
 ║           Gemini OpenAI Compatible API Server            ║
 ╠══════════════════════════════════════════════════════════╣
-║  后台配置: http://localhost:{PORT}/admin                   ║
-║  API 地址: http://localhost:{PORT}/v1                      ║
+║  本地访问:                                                ║
+║    后台配置: http://localhost:{PORT}/admin                   ║
+║    API 地址: http://localhost:{PORT}/v1                      ║
+║                                                           ║
+║  外部访问（手机/其他设备）:                                ║
+║    后台配置: http://{local_ip}:{PORT}/admin                   ║
+║    API 地址: http://{local_ip}:{PORT}/v1                      ║
+║                                                           ║
 ║  API Key:  {API_KEY}                                     ║
 ╚══════════════════════════════════════════════════════════╝
 """)

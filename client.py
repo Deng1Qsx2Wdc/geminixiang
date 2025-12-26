@@ -158,6 +158,9 @@ class GeminiClient:
         # 消息历史
         self.messages: List[Message] = []
         
+        # 消息历史限制（默认保留最近 50 轮对话，即 100 条消息）
+        self.max_history_messages: int = 100
+        
         # 验证必填参数
         if not self.snlm0e:
             raise ValueError(
@@ -527,7 +530,7 @@ class GeminiClient:
 
     
     def _parse_response(self, response_text: str) -> str:
-        """解析响应文本 - 修复版"""
+        """解析响应文本 - 支持引用内容版本"""
         try:
             # 跳过前缀并按行解析
             lines = response_text.split("\n")
@@ -548,36 +551,108 @@ class GeminiClient:
                     if isinstance(data, list) and len(data) > 0 and isinstance(data[0], list):
                         actual_data = data[0]
                         # 检查是否是 wrb.fr 响应
-                        if len(actual_data) >= 3 and actual_data[0] == "wrb.fr" and actual_data[2]:
-                            inner_json = json.loads(actual_data[2])
-                            # 提取文本内容
-                            if inner_json and len(inner_json) > 4 and inner_json[4]:
-                                candidates = inner_json[4]
-                                if candidates and len(candidates) > 0:
-                                    candidate = candidates[0]
-                                    if candidate and len(candidate) > 1 and candidate[1]:
-                                        # candidate[1] 是一个数组，第一个元素是文本
-                                        text = candidate[1][0] if isinstance(candidate[1], list) else candidate[1]
-                                        if isinstance(text, str) and len(text) > len(final_text):
-                                            final_text = text
-                                            # 更新会话上下文
-                                            if len(inner_json) > 1 and inner_json[1]:
-                                                if isinstance(inner_json[1], list):
-                                                    if len(inner_json[1]) > 0:
-                                                        self.conversation_id = inner_json[1][0] or self.conversation_id
-                                                    if len(inner_json[1]) > 1:
-                                                        self.response_id = inner_json[1][1] or self.response_id
-                                            if len(candidate) > 0:
-                                                self.choice_id = candidate[0] or self.choice_id
+                        if len(actual_data) >= 3 and actual_data[0] == "wrb.fr":
+                            # 处理引用内容状态：[[\"wrb.fr\",null,null,null,null,[9]]]
+                            if len(actual_data) >= 6 and actual_data[5] and isinstance(actual_data[5], list):
+                                # 这是引用内容状态，跳过
+                                continue
+                            
+                            if actual_data[2]:
+                                inner_json = json.loads(actual_data[2])
+                                
+                                # 更新会话上下文（即使没有文本内容）
+                                if len(inner_json) > 1 and inner_json[1]:
+                                    if isinstance(inner_json[1], list):
+                                        if len(inner_json[1]) > 0:
+                                            self.conversation_id = inner_json[1][0] or self.conversation_id
+                                        if len(inner_json[1]) > 1:
+                                            self.response_id = inner_json[1][1] or self.response_id
+                                
+                                # 提取文本内容
+                                if inner_json and len(inner_json) > 4 and inner_json[4]:
+                                    candidates = inner_json[4]
+                                    if candidates and len(candidates) > 0:
+                                        candidate = candidates[0]
+                                        if candidate and len(candidate) > 1 and candidate[1]:
+                                            # candidate[1] 可能是数组或字符串
+                                            content_parts = candidate[1]
+                                            
+                                            # 处理不同的内容格式（支持引用内容）
+                                            text = ""
+                                            if isinstance(content_parts, list):
+                                                # 遍历所有内容部分，提取文本
+                                                for part in content_parts:
+                                                    if isinstance(part, str):
+                                                        text += part
+                                                    elif isinstance(part, dict):
+                                                        # 处理带格式的内容（如引用、链接等）
+                                                        if "text" in part:
+                                                            text += part["text"]
+                                                        elif "content" in part:
+                                                            text += str(part["content"])
+                                                        elif "parts" in part:
+                                                            # 处理 parts 数组（可能包含引用内容）
+                                                            for subpart in part.get("parts", []):
+                                                                if isinstance(subpart, str):
+                                                                    text += subpart
+                                                                elif isinstance(subpart, dict):
+                                                                    if "text" in subpart:
+                                                                        text += subpart["text"]
+                                                                    elif "inlineData" in subpart:
+                                                                        # 跳过图片数据
+                                                                        continue
+                                                                    elif "functionCall" in subpart:
+                                                                        # 跳过函数调用
+                                                                        continue
+                                                        elif "inlineData" in part:
+                                                            # 跳过图片数据
+                                                            continue
+                                                        elif "functionCall" in part:
+                                                            # 跳过函数调用
+                                                            continue
+                                                        else:
+                                                            # 尝试提取所有可能的文本字段
+                                                            for key in ["text", "content", "value"]:
+                                                                if key in part:
+                                                                    text += str(part[key])
+                                                                    break
+                                                    else:
+                                                        text += str(part)
+                                            elif isinstance(content_parts, str):
+                                                text = content_parts
+                                            else:
+                                                text = str(content_parts)
+                                            
+                                            if isinstance(text, str) and len(text.strip()) > 0:
+                                                # 如果新文本更长，或者当前文本为空，则更新
+                                                if len(text) > len(final_text) or not final_text:
+                                                    final_text = text
+                                                    if len(candidate) > 0:
+                                                        self.choice_id = candidate[0] or self.choice_id
                 except Exception as e:
+                    if self.debug:
+                        import traceback
+                        print(f"[DEBUG] 解析行错误: {e}")
+                        print(f"[DEBUG] 行内容: {line[:200]}")
+                        print(f"[DEBUG] 错误详情: {traceback.format_exc()}")
                     continue
             
-            if final_text:
-                return final_text
+            if final_text and final_text.strip():
+                return final_text.strip()
                 
         except Exception as e:
             if self.debug:
+                import traceback
                 print(f"[DEBUG] 解析错误: {e}")
+                print(f"[DEBUG] 响应内容前1000字符: {response_text[:1000]}")
+                print(f"[DEBUG] 错误详情: {traceback.format_exc()}")
+                # 保存完整响应用于调试
+                try:
+                    with open("debug_response_failed.txt", "w", encoding="utf-8") as f:
+                        f.write(response_text)
+                    print(f"[DEBUG] 完整响应已保存到 debug_response_failed.txt")
+                except:
+                    pass
         
         return "无法解析响应"
 
@@ -657,13 +732,32 @@ class GeminiClient:
         images = []
         
         if messages:
-            # OpenAI 格式
+            # OpenAI 格式 - 处理所有消息（保留历史上下文）
+            # 只提取最后一条用户消息的内容用于发送
             for msg in messages:
-                if msg.get("role") == "user":
-                    t, imgs = self._parse_content(msg.get("content", ""))
+                role = msg.get("role", "")
+                content = msg.get("content", "")
+                
+                # 保存所有消息到历史（用于上下文）
+                if role == "user":
+                    self.messages.append(Message(role="user", content=content))
+                    # 只提取最后一条用户消息的内容
+                    t, imgs = self._parse_content(content)
                     text = t
                     images = imgs
-                    self.messages.append(Message(role="user", content=msg.get("content")))
+                elif role == "assistant":
+                    # 保存 assistant 的回复到历史
+                    self.messages.append(Message(role="assistant", content=content))
+                # 忽略 system 等其他角色的消息
+            
+            # 限制消息历史数量（保留最近的对话）
+            if len(self.messages) > self.max_history_messages:
+                # 保留最近的消息，删除最旧的消息
+                # 但要确保保留完整的对话对（user + assistant）
+                keep_count = self.max_history_messages
+                if keep_count % 2 == 1:  # 如果是奇数，减1确保是偶数（成对保留）
+                    keep_count -= 1
+                self.messages = self.messages[-keep_count:]
         elif message:
             text = message
             self.messages.append(Message(role="user", content=message))
@@ -768,7 +862,7 @@ class GeminiClient:
             
             if self.debug:
                 print(f"[DEBUG] 响应状态: {resp.status_code}")
-                print(f"[DEBUG] 响应内容前500字符: {resp.text[:500]}")
+                print(f"[DEBUG] 响应内容前1000字符: {resp.text[:1000]}")
                 if image_paths:
                     # 保存完整响应用于调试
                     with open("debug_image_response.txt", "w", encoding="utf-8") as f:
@@ -782,6 +876,41 @@ class GeminiClient:
             self.request_count += 1
             
             reply_text = self._parse_response(resp.text)
+            
+            # 如果解析失败，可能是引用内容状态，尝试等待或重试
+            if reply_text == "无法解析响应":
+                if self.debug:
+                    print(f"[DEBUG] 解析失败，检查是否为引用内容状态")
+                    # 检查是否包含引用内容标记
+                    if '[9]' in resp.text or 'null,null,null,null,[9]' in resp.text:
+                        print(f"[DEBUG] 检测到引用内容状态标记")
+                        # 尝试从响应中提取更多信息
+                        try:
+                            lines = resp.text.split("\n")
+                            for i, line in enumerate(lines):
+                                line = line.strip()
+                                if not line or line.startswith(")]}'") or line.isdigit():
+                                    continue
+                                try:
+                                    data = json.loads(line)
+                                    if isinstance(data, list) and len(data) > 0 and isinstance(data[0], list):
+                                        actual_data = data[0]
+                                        if len(actual_data) >= 3 and actual_data[0] == "wrb.fr" and actual_data[2]:
+                                            inner_json = json.loads(actual_data[2])
+                                            print(f"[DEBUG] 响应结构: inner_json长度={len(inner_json) if inner_json else 0}")
+                                            if inner_json:
+                                                for idx, item in enumerate(inner_json):
+                                                    if item:
+                                                        print(f"[DEBUG] inner_json[{idx}] = {str(item)[:200]}")
+                        except Exception as e:
+                            print(f"[DEBUG] 分析响应结构时出错: {e}")
+                        # 保存失败响应用于分析
+                        try:
+                            with open("debug_citation_response.txt", "w", encoding="utf-8") as f:
+                                f.write(resp.text)
+                            print(f"[DEBUG] 引用内容响应已保存到 debug_citation_response.txt")
+                        except:
+                            pass
             
             # 保存助手回复
             self.messages.append(Message(role="assistant", content=reply_text))
