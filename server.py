@@ -3,17 +3,17 @@ Gemini OpenAI 兼容 API 服务
 
 启动: python server.py
 本地访问:
-  后台: http://localhost:8001/admin
-  API:  http://localhost:8001/v1
+  后台: http://localhost:8000/admin
+  API:  http://localhost:8000/v1
 外部访问（手机/其他设备）:
-  后台: http://服务器IP:8001/admin
-  API:  http://服务器IP:8001/v1
+  后台: http://服务器IP:8000/admin
+  API:  http://服务器IP:8000/v1
 """
 
 from fastapi import FastAPI, HTTPException, Header, Request
 from fastapi.middleware.cors import CORSMiddleware
 from fastapi.responses import HTMLResponse, RedirectResponse, StreamingResponse, JSONResponse
-from pydantic import BaseModel
+from pydantic import BaseModel, ConfigDict
 from typing import List, Dict, Any, Optional, Union
 import uvicorn
 import time
@@ -24,11 +24,13 @@ import re
 import httpx
 import hashlib
 import secrets
+import socket
+import subprocess
 
 # ============ 配置 ============
 API_KEY = "sk-gemini"
 HOST = "0.0.0.0"
-PORT = 8001
+PORT = 8000
 CONFIG_FILE = "config_data.json"
 # 后台登录账号密码
 ADMIN_USERNAME = "admin"
@@ -75,6 +77,7 @@ _config = {
     "PUSH_ID": "",
     "FULL_COOKIE": "",  # 存储完整cookie字符串
     "MODELS": DEFAULT_MODELS.copy(),  # 可用模型列表
+    "PROXY": "",  # 代理地址 (可选，格式: "http://proxy.example.com:8080" 或 "socks5://proxy.example.com:1080")
 }
 
 # Cookie 字段映射 (浏览器cookie名 -> 配置字段名)
@@ -250,6 +253,7 @@ def get_client():
         snlm0e=_config["SNLM0E"],
         cookies_str=cookies,
         push_id=_config.get("PUSH_ID") or None,
+        proxy=_config.get("PROXY") or None,  # 支持代理配置
         debug=True,  # 启用调试模式以查看响应格式
     )
     return _client
@@ -396,6 +400,14 @@ def get_admin_html():
                 2. F12 → 网络 → 发送内容到聊天 →  点击任意请求 → Copy 请求头内完整cookie
             </div>
             
+            <div class="info-box" style="background: #fff3cd; border-left: 4px solid #ffc107;">
+                <strong>💡 图片上传网络问题：</strong><br>
+                如果图片上传失败（网络连接超时），请配置代理：<br>
+                • <strong>Clash 用户</strong>: 输入 <code>http://127.0.0.1:7890</code>（默认端口，如果不是请改为实际端口）<br>
+                • <strong>其他代理</strong>: 输入对应的 HTTP 代理地址，格式: <code>http://代理地址:端口</code><br>
+                • 确保代理客户端已启动并正常运行
+            </div>
+            
             <form id="configForm">
                 <div class="section">
                     <div class="section-title">🔑 Cookie 配置</div>
@@ -406,6 +418,21 @@ def get_admin_html():
                             <h4>✅ 已解析的字段：</h4>
                             <div id="parsedFields"></div>
                         </div>
+                    </div>
+                </div>
+                
+                <div class="section">
+                    <div class="section-title">🌐 网络代理配置 <span class="optional">(可选)</span></div>
+                    <div class="info-box">
+                        <strong>说明：</strong><br>
+                        • <strong>美国/海外服务器</strong>: 通常不需要配置代理，可以直接访问 Google 服务器<br>
+                        • <strong>中国大陆服务器</strong>: 如果图片上传失败（网络连接超时），需要配置代理<br>
+                        • 格式: <code>http://proxy.example.com:8080</code> 或 <code>socks5://proxy.example.com:1080</code><br>
+                        • <strong>留空即可</strong>: 如果不配置代理，直接留空即可
+                    </div>
+                    <div class="form-group">
+                        <label>代理地址 <span class="optional">(可选，通常不需要)</span></label>
+                        <input type="text" name="PROXY" id="PROXY" placeholder="留空即可（美国服务器通常不需要）或输入代理地址，例如: http://127.0.0.1:7890">
                     </div>
                 </div>
                 
@@ -420,6 +447,22 @@ def get_admin_html():
                 <p>Base URL: <strong id="baseUrl"></strong></p>
                 <p>API Key: <strong id="apiKey"></strong></p>
                 <p style="margin-top: 10px; font-size: 12px; color: #666;">💡 服务器地址: <strong id="serverIp"></strong></p>
+            </div>
+            
+            <div class="api-info" style="margin-top: 20px;">
+                <h3>📝 使用示例</h3>
+                <div style="margin-top: 15px;">
+                    <h4 style="font-size: 13px; margin-bottom: 8px; color: #555;">1. 文本对话</h4>
+                    <pre id="example1" style="background: #fff; padding: 12px; border-radius: 6px; font-size: 12px; overflow-x: auto; margin: 0;"></pre>
+                </div>
+                <div style="margin-top: 15px;">
+                    <h4 style="font-size: 13px; margin-bottom: 8px; color: #555;">2. 图片识别</h4>
+                    <pre id="example2" style="background: #fff; padding: 12px; border-radius: 6px; font-size: 12px; overflow-x: auto; margin: 0;"></pre>
+                </div>
+                <div style="margin-top: 15px;">
+                    <h4 style="font-size: 13px; margin-bottom: 8px; color: #555;">3. 流式响应</h4>
+                    <pre id="example3" style="background: #fff; padding: 12px; border-radius: 6px; font-size: 12px; overflow-x: auto; margin: 0;"></pre>
+                </div>
             </div>
         </div>
     </div>
@@ -528,6 +571,9 @@ def get_admin_html():
             if (config.FULL_COOKIE) {
                 document.getElementById('FULL_COOKIE').value = config.FULL_COOKIE;
                 showParsedFields(parseCookie(config.FULL_COOKIE));
+            }
+            if (config.PROXY) {
+                document.getElementById('PROXY').value = config.PROXY;
             }
         }).catch(err => {
             console.log('加载配置失败:', err);
@@ -658,6 +704,13 @@ async def admin_save(request: Request):
     for field in ["SECURE_1PSID", "SECURE_1PSIDTS", "SAPISID", "SID", "HSID", "SSID", "APISID"]:
         _config[field] = parsed.get(field, "")
     
+    # 更新代理配置（如果提供）
+    proxy = data.get("PROXY", "").strip()
+    if proxy:
+        _config["PROXY"] = proxy
+    else:
+        _config["PROXY"] = ""
+    
     # 使用自动获取的模型列表，如果获取失败则使用默认值
     if tokens.get("models"):
         _config["MODELS"] = tokens["models"]
@@ -697,15 +750,16 @@ async def admin_get_config(request: Request):
 # ============ API 路由 ============
 
 class ChatMessage(BaseModel):
+    model_config = ConfigDict(extra="ignore")
+    
     role: str
     content: Union[str, List[Dict[str, Any]]]
     name: Optional[str] = None
-    
-    class Config:
-        extra = "ignore"
 
 
 class ChatCompletionRequest(BaseModel):
+    model_config = ConfigDict(extra="ignore")  # 忽略未定义的额外字段
+    
     model: str = "gemini"
     messages: List[ChatMessage]
     stream: Optional[bool] = False
@@ -718,9 +772,6 @@ class ChatCompletionRequest(BaseModel):
     stop: Optional[Union[str, List[str]]] = None
     n: Optional[int] = None
     user: Optional[str] = None
-    
-    class Config:
-        extra = "ignore"  # 忽略未定义的额外字段
 
 
 class ChatCompletionChoice(BaseModel):
@@ -1026,13 +1077,58 @@ async def get_server_info(request: Request):
     if not verify_admin_session(request):
         raise HTTPException(status_code=401, detail="未登录")
     import socket
+    import subprocess
+    
+    def get_server_ip():
+        # 方法1: 尝试获取公网 IP
+        try:
+            with httpx.Client(timeout=2) as client:
+                resp = client.get("https://api.ipify.org", timeout=2)
+                if resp.status_code == 200:
+                    public_ip = resp.text.strip()
+                    if public_ip and public_ip != "":
+                        return public_ip
+        except:
+            pass
+        
+        # 方法2: 通过系统命令获取 IP（Linux）
+        try:
+            # 尝试使用 hostname -I 获取所有 IP
+            result = subprocess.run(['hostname', '-I'], capture_output=True, text=True, timeout=2)
+            if result.returncode == 0:
+                ips = result.stdout.strip().split()
+                for ip in ips:
+                    if ip and ip != '127.0.0.1' and not ip.startswith('169.254.'):
+                        parts = ip.split('.')
+                        if len(parts) == 4:
+                            try:
+                                first = int(parts[0])
+                                second = int(parts[1])
+                                # 跳过内网段，优先返回公网 IP
+                                if not (first == 10 or 
+                                       (first == 172 and 16 <= second <= 31) or 
+                                       (first == 192 and second == 168)):
+                                    return ip
+                            except:
+                                continue
+        except:
+            pass
+        
+        # 方法3: 使用原来的方法（连接外部地址获取本地 IP）
+        try:
+            s = socket.socket(socket.AF_INET, socket.SOCK_DGRAM)
+            s.connect(("8.8.8.8", 80))
+            server_ip = s.getsockname()[0]
+            s.close()
+            return server_ip
+        except:
+            return "127.0.0.1"
+    
     try:
-        s = socket.socket(socket.AF_INET, socket.SOCK_DGRAM)
-        s.connect(("8.8.8.8", 80))
-        server_ip = s.getsockname()[0]
-        s.close()
+        server_ip = get_server_ip()
     except:
         server_ip = "127.0.0.1"
+    
     return {"server_ip": server_ip, "port": PORT}
 
 
@@ -1040,16 +1136,63 @@ load_config()
 
 if __name__ == "__main__":
     import socket
-    # 获取本机 IP 地址
+    import subprocess
+    
+    # 获取本机 IP 地址（改进版）
     def get_local_ip():
+        # 优先获取内网IP（局域网可访问的IP）
+        # 方法1: 使用socket连接获取本地IP（最可靠）
         try:
             s = socket.socket(socket.AF_INET, socket.SOCK_DGRAM)
             s.connect(("8.8.8.8", 80))
             ip = s.getsockname()[0]
             s.close()
-            return ip
+            if ip and ip != '127.0.0.1':
+                return ip
         except:
-            return "服务器IP"
+            pass
+        
+        # 方法2: 通过系统命令获取 IP（Linux/Windows）
+        try:
+            import platform
+            if platform.system() == "Windows":
+                # Windows: 使用 ipconfig
+                result = subprocess.run(['ipconfig'], capture_output=True, text=True, timeout=2)
+                if result.returncode == 0:
+                    lines = result.stdout.split('\n')
+                    for i, line in enumerate(lines):
+                        if 'IPv4' in line or 'IP Address' in line:
+                            # 查找下一行的IP地址
+                            if i + 1 < len(lines):
+                                ip_line = lines[i + 1].strip()
+                                # 提取IP地址
+                                ip_match = re.search(r'(\d+\.\d+\.\d+\.\d+)', ip_line)
+                                if ip_match:
+                                    ip = ip_match.group(1)
+                                    if ip and ip != '127.0.0.1' and not ip.startswith('169.254.'):
+                                        return ip
+            else:
+                # Linux/Mac: 使用 hostname -I
+                result = subprocess.run(['hostname', '-I'], capture_output=True, text=True, timeout=2)
+                if result.returncode == 0:
+                    ips = result.stdout.strip().split()
+                    for ip in ips:
+                        if ip and ip != '127.0.0.1' and not ip.startswith('169.254.'):
+                            return ip
+        except:
+            pass
+        
+        # 方法3: 尝试获取所有网络接口的IP
+        try:
+            hostname = socket.gethostname()
+            ip = socket.gethostbyname(hostname)
+            if ip and ip != '127.0.0.1':
+                return ip
+        except:
+            pass
+        
+        # 如果都失败了，返回默认值
+        return "服务器IP"
     
     local_ip = get_local_ip()
     

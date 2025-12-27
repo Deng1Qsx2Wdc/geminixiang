@@ -6,6 +6,7 @@ Gemini Web Reverse Engineering Client
 
 import re
 import json
+import os
 import random
 import string
 import base64
@@ -104,6 +105,7 @@ class GeminiClient:
         bl: str = None,
         cookies_str: str = None,
         push_id: str = None,
+        proxy: str = None,
         debug: bool = False,
     ):
         """
@@ -117,6 +119,7 @@ class GeminiClient:
             bl: BL 版本号 (可选，自动获取)
             cookies_str: 完整 cookie 字符串 (可选，替代单独设置)
             push_id: Push ID for image upload (必填用于图片上传)
+            proxy: 代理地址 (可选，格式: "http://proxy.example.com:8080" 或 "socks5://proxy.example.com:1080")
             debug: 是否打印调试信息
         """
         self.secure_1psid = secure_1psid
@@ -125,19 +128,46 @@ class GeminiClient:
         self.snlm0e = snlm0e
         self.bl = bl
         self.push_id = push_id
+        self.proxy = proxy
         self.debug = debug
         
-        self.session = httpx.Client(
-            timeout=1220.0,
-            follow_redirects=True,
-            headers={
+        # 构建 httpx 客户端参数
+        client_kwargs = {
+            "timeout": 1220.0,
+            "follow_redirects": True,
+            "headers": {
                 "User-Agent": "Mozilla/5.0 (Windows NT 10.0; Win64; x64) AppleWebKit/537.36 (KHTML, like Gecko) Chrome/131.0.0.0 Safari/537.36",
                 "Content-Type": "application/x-www-form-urlencoded;charset=UTF-8",
                 "Origin": self.BASE_URL,
                 "Referer": f"{self.BASE_URL}/",
                 "Accept-Language": "zh-CN,zh;q=0.9,en;q=0.8",
             },
-        )
+        }
+        
+        # 如果设置了代理，添加到客户端参数
+        # httpx 使用 proxy 参数（不是 proxies），可以直接接受字符串
+        if proxy:
+            # httpx 的 proxy 参数可以直接接受字符串格式的代理地址
+            if isinstance(proxy, str):
+                # 确保代理地址格式正确
+                if not proxy.startswith(("http://", "https://", "socks5://", "socks4://")):
+                    # 默认当作 HTTP 代理
+                    proxy = f"http://{proxy}"
+                client_kwargs["proxy"] = proxy
+            elif isinstance(proxy, dict):
+                # 如果是字典格式，httpx 也支持，但通常使用字符串更简单
+                # 为了兼容，我们可以提取第一个值
+                proxy_value = list(proxy.values())[0] if proxy else None
+                if proxy_value:
+                    client_kwargs["proxy"] = proxy_value
+            else:
+                # 其他格式，尝试转换为字符串
+                client_kwargs["proxy"] = str(proxy)
+            
+            if self.debug:
+                print(f"[DEBUG] 使用代理: {client_kwargs['proxy']}")
+        
+        self.session = httpx.Client(**client_kwargs)
         
         # 设置 cookies
         if cookies_str:
@@ -161,6 +191,9 @@ class GeminiClient:
         # 消息历史限制（默认保留最近 50 轮对话，即 100 条消息）
         self.max_history_messages: int = 100
         
+        # 会话状态文件路径
+        self.session_file: str = "conversation_state.json"
+        
         # 验证必填参数
         if not self.snlm0e:
             raise ValueError(
@@ -175,6 +208,9 @@ class GeminiClient:
         # 自动获取 bl
         if not self.bl:
             self._fetch_bl()
+        
+        # 尝试加载之前的会话状态
+        self._load_session_state()
     
     def _set_cookies_from_string(self, cookies_str: str):
         """从完整 cookie 字符串解析"""
@@ -299,10 +335,13 @@ class GeminiClient:
                 "x-tenant-id": "bard-storage",
             }
             
-            init_resp = self.session.post(upload_url, data={"File name": filename}, headers=init_headers)
+            init_resp = self.session.post(upload_url, data={"File name": filename}, headers=init_headers, timeout=30.0)
             
             if self.debug:
                 print(f"[DEBUG] 初始化上传状态: {init_resp.status_code}")
+                print(f"[DEBUG] 初始化响应头: {dict(init_resp.headers)}")
+                if init_resp.status_code != 200:
+                    print(f"[DEBUG] 初始化响应内容: {init_resp.text[:500]}")
             
             # 检查初始化响应状态
             if init_resp.status_code == 401 or init_resp.status_code == 403:
@@ -312,15 +351,17 @@ class GeminiClient:
                     "1. __Secure-1PSID\n"
                     "2. __Secure-1PSIDTS\n"
                     "3. SNlM0e\n"
-                    "4. push_id"
+                    "4. push_id\n"
+                    f"响应内容: {init_resp.text[:200] if init_resp.text else '(empty)'}"
                 )
             
             upload_id = init_resp.headers.get("x-guploader-uploadid")
             if not upload_id:
-                raise CookieExpiredError(
-                    f"未获取到 upload_id (状态码: {init_resp.status_code})\n"
-                    "可能原因: Cookie 已过期，请重新获取所有 token"
-                )
+                error_msg = f"未获取到 upload_id (状态码: {init_resp.status_code})"
+                if init_resp.text:
+                    error_msg += f"\n响应内容: {init_resp.text[:200]}"
+                error_msg += "\n可能原因: Cookie 已过期，请重新获取所有 token"
+                raise CookieExpiredError(error_msg)
             
             if self.debug:
                 print(f"[DEBUG] Upload ID: {upload_id[:50]}...")
@@ -330,7 +371,7 @@ class GeminiClient:
             
             upload_headers = {
                 **browser_headers,
-                "content-type": "application/x-www-form-urlencoded;charset=utf-8",
+                "content-type": mime_type,  # 使用图片的 MIME 类型，而不是 form-urlencoded
                 "push-id": self.push_id,
                 "x-goog-upload-command": "upload, finalize",
                 "x-goog-upload-offset": "0",
@@ -341,7 +382,8 @@ class GeminiClient:
             upload_resp = self.session.post(
                 final_upload_url,
                 headers=upload_headers,
-                content=image_data
+                content=image_data,
+                timeout=60.0  # 上传可能需要更长时间
             )
             
             if self.debug:
@@ -405,10 +447,38 @@ class GeminiClient:
             
         except CookieExpiredError:
             raise
+        except httpx.ConnectTimeout as e:
+            # 网络连接超时，提供更友好的错误信息
+            error_msg = (
+                "图片上传失败: 网络连接超时\n"
+                "无法连接到 push.clients6.google.com\n\n"
+                "可能的原因:\n"
+                "1. 网络无法访问 Google 服务器（可能需要代理/VPN）\n"
+                "2. 防火墙阻止了连接\n"
+                "3. DNS 解析问题\n\n"
+                "解决方法:\n"
+                "1. 配置代理: 在 server.py 的 get_client() 函数中添加 proxy 参数\n"
+                "2. 检查网络连接和防火墙设置\n"
+                "3. 尝试使用 VPN 或代理服务\n"
+            )
+            if self.proxy:
+                error_msg += f"\n当前使用的代理: {self.proxy}\n如果代理无效，请检查代理配置"
+            raise ImageUploadError(error_msg)
+        except httpx.NetworkError as e:
+            # 其他网络错误
+            error_msg = (
+                f"图片上传失败: 网络错误 ({type(e).__name__})\n"
+                f"错误详情: {str(e)}\n\n"
+                "可能的原因:\n"
+                "1. 网络连接不稳定\n"
+                "2. 无法访问 Google 服务器\n"
+                "3. 需要配置代理\n"
+            )
+            raise ImageUploadError(error_msg)
         except Exception as e:
             if self.debug:
                 print(f"[DEBUG] 上传失败: {e}")
-            raise Exception(f"图片上传失败: {e}")
+            raise ImageUploadError(f"图片上传失败: {e}")
     
     def _extract_image_path(self, data: Any) -> str:
         """从响应数据中递归提取图片路径"""
@@ -553,9 +623,15 @@ class GeminiClient:
                         # 检查是否是 wrb.fr 响应
                         if len(actual_data) >= 3 and actual_data[0] == "wrb.fr":
                             # 处理引用内容状态：[[\"wrb.fr\",null,null,null,null,[9]]]
+                            # [9] 是引用内容状态标记，可以跳过
+                            # [3] 是知识库响应标记，不应该跳过，应该正常处理
                             if len(actual_data) >= 6 and actual_data[5] and isinstance(actual_data[5], list):
-                                # 这是引用内容状态，跳过
-                                continue
+                                citation_type = actual_data[5][0] if len(actual_data[5]) > 0 else None
+                                # 只有 [9] 是引用内容状态，才跳过
+                                if citation_type == 9:
+                                    # 这是引用内容状态，跳过
+                                    continue
+                                # [3] 是知识库响应，不跳过，继续处理
                             
                             if actual_data[2]:
                                 inner_json = json.loads(actual_data[2])
@@ -563,10 +639,25 @@ class GeminiClient:
                                 # 更新会话上下文（即使没有文本内容）
                                 if len(inner_json) > 1 and inner_json[1]:
                                     if isinstance(inner_json[1], list):
-                                        if len(inner_json[1]) > 0:
+                                        # 处理 [null, "response_id"] 格式（流式响应初始块）
+                                        old_conv_id = self.conversation_id
+                                        old_resp_id = self.response_id
+                                        
+                                        if len(inner_json[1]) > 0 and inner_json[1][0]:
                                             self.conversation_id = inner_json[1][0] or self.conversation_id
-                                        if len(inner_json[1]) > 1:
+                                        if len(inner_json[1]) > 1 and inner_json[1][1]:
                                             self.response_id = inner_json[1][1] or self.response_id
+                                        # 如果第一个是null，第二个是response_id，尝试从其他地方获取conversation_id
+                                        elif len(inner_json[1]) == 2 and inner_json[1][0] is None and inner_json[1][1]:
+                                            self.response_id = inner_json[1][1] or self.response_id
+                                            # 检查inner_json的其他位置是否有conversation_id
+                                            # 有时conversation_id在inner_json[16]位置
+                                            if len(inner_json) > 16 and inner_json[16]:
+                                                self.conversation_id = inner_json[16] or self.conversation_id
+                                        
+                                        # 如果会话上下文有更新，保存状态
+                                        if self.conversation_id != old_conv_id or self.response_id != old_resp_id:
+                                            self._save_session_state()
                                 
                                 # 提取文本内容
                                 if inner_json and len(inner_json) > 4 and inner_json[4]:
@@ -629,6 +720,8 @@ class GeminiClient:
                                                     final_text = text
                                                     if len(candidate) > 0:
                                                         self.choice_id = candidate[0] or self.choice_id
+                                                    # 保存会话状态
+                                                    self._save_session_state()
                 except Exception as e:
                     if self.debug:
                         import traceback
@@ -816,8 +909,11 @@ class GeminiClient:
         image_paths = []
         if images and len(images) > 0:
             if not self.push_id:
-                print("⚠️  图片上传需要 push-id，请运行: python get_push_id.py")
-                print("   然后将获取的 push-id 添加到 config.py")
+                raise CookieExpiredError(
+                    "图片上传需要 push-id\n"
+                    "获取方法: 运行 python get_push_id.py 或从浏览器 Network 中获取\n"
+                    "或者在后台配置页面重新保存 Cookie，系统会自动获取 push-id"
+                )
             else:
                 try:
                     for img in images:
@@ -828,9 +924,12 @@ class GeminiClient:
                         image_paths.append(path)
                         if self.debug:
                             print(f"[DEBUG] 图片上传成功: {path[:50]}...")
+                except CookieExpiredError:
+                    # Cookie 过期错误直接抛出
+                    raise
                 except Exception as e:
-                    print(f"⚠️  图片上传失败: {e}")
-                    image_paths = []
+                    # 其他错误也抛出，让调用者知道上传失败
+                    raise ImageUploadError(f"图片上传失败: {e}")
         
         req_data = self._build_request_data(text, images, image_paths, model)
         
@@ -877,17 +976,121 @@ class GeminiClient:
             
             reply_text = self._parse_response(resp.text)
             
-            # 如果解析失败，可能是引用内容状态，尝试等待或重试
+            # 如果解析失败，可能是流式响应的初始块或引用内容状态
             if reply_text == "无法解析响应":
                 if self.debug:
-                    print(f"[DEBUG] 解析失败，检查是否为引用内容状态")
-                    # 检查是否包含引用内容标记
-                    if '[9]' in resp.text or 'null,null,null,null,[9]' in resp.text:
-                        print(f"[DEBUG] 检测到引用内容状态标记")
-                        # 尝试从响应中提取更多信息
+                    print(f"[DEBUG] 解析失败，检查响应类型")
+                    # 检查是否为流式响应的初始块（inner_json[4]为null）
+                    is_streaming_initial = False
+                    has_citation_marker = False
+                    
+                    try:
+                        lines = resp.text.split("\n")
+                        for i, line in enumerate(lines):
+                            line = line.strip()
+                            if not line or line.startswith(")]}'") or line.isdigit():
+                                continue
+                            try:
+                                data = json.loads(line)
+                                if isinstance(data, list) and len(data) > 0 and isinstance(data[0], list):
+                                    actual_data = data[0]
+                                    if len(actual_data) >= 3 and actual_data[0] == "wrb.fr" and actual_data[2]:
+                                        inner_json = json.loads(actual_data[2])
+                                        print(f"[DEBUG] 响应结构: inner_json长度={len(inner_json) if inner_json else 0}")
+                                        
+                                        # 检查是否是流式响应的初始块
+                                        if inner_json and len(inner_json) > 4 and inner_json[4] is None:
+                                            is_streaming_initial = True
+                                            print(f"[DEBUG] 检测到流式响应初始块（inner_json[4]为null）")
+                                            # 检查是否有response_id
+                                            if len(inner_json) > 1 and inner_json[1] and isinstance(inner_json[1], list):
+                                                if len(inner_json[1]) > 1 and inner_json[1][1]:
+                                                    print(f"[DEBUG] 响应ID: {inner_json[1][1]}")
+                                        
+                                        # 检查引用内容标记
+                                        if len(actual_data) >= 6 and actual_data[5] and isinstance(actual_data[5], list) and len(actual_data[5]) > 0:
+                                            if actual_data[5][0] == 3 or actual_data[5][0] == 9:
+                                                has_citation_marker = True
+                                                print(f"[DEBUG] 检测到引用内容状态标记: {actual_data[5]}")
+                                        
+                                        if inner_json:
+                                            for idx, item in enumerate(inner_json):
+                                                if item:
+                                                    print(f"[DEBUG] inner_json[{idx}] = {str(item)[:200]}")
+                            except Exception as e:
+                                if self.debug:
+                                    print(f"[DEBUG] 解析行错误: {e}")
+                                continue
+                    except Exception as e:
+                        print(f"[DEBUG] 分析响应结构时出错: {e}")
+                    
+                    # 如果是流式响应的初始块，说明图片正在处理中
+                    # 注意：重新发送请求会创建新请求，而不是获取之前的响应
+                    # 因此，我们只等待一次，然后直接返回提示
+                    if is_streaming_initial and self.response_id:
+                        print(f"[DEBUG] 这是流式响应的初始块，图片正在处理中")
+                        print(f"[DEBUG] 当前conversation_id: {self.conversation_id}")
+                        print(f"[DEBUG] 当前response_id: {self.response_id}")
+                        
+                        # 等待一段时间让服务器处理图片（图片处理通常需要10-20秒）
+                        wait_time = 20  # 等待20秒
+                        print(f"[DEBUG] 等待 {wait_time} 秒让服务器处理图片...")
+                        time.sleep(wait_time)
+                        
+                        # 只重试一次，避免创建多个新请求
+                        try:
+                            # 重新发送原始请求（包含图片路径），使用相同的参数
+                            retry_params = params.copy()
+                            retry_params["_reqid"] = str(self.request_count * 100000 + random.randint(10000, 99999))
+                            
+                            print(f"[DEBUG] 重新发送请求以获取完整响应...")
+                            retry_resp = self.session.post(url, params=retry_params, data=form_data, timeout=60.0)
+                            
+                            if retry_resp.status_code == 200:
+                                if self.debug:
+                                    print(f"[DEBUG] 重试响应状态: {retry_resp.status_code}")
+                                    print(f"[DEBUG] 重试响应内容前1000字符: {retry_resp.text[:1000]}")
+                                
+                                # 解析重试响应
+                                retry_text = self._parse_response(retry_resp.text)
+                                
+                                if retry_text and retry_text != "无法解析响应":
+                                    print(f"[DEBUG] 重试成功，获取到响应内容")
+                                    reply_text = retry_text
+                                else:
+                                    # 如果还是无法解析，说明图片处理需要更长时间
+                                    print(f"[DEBUG] 重试后仍无法获取响应，图片处理可能需要更长时间")
+                                    reply_text = "图片处理时间较长，请稍后重试或发送新消息继续对话"
+                            else:
+                                print(f"[DEBUG] 重试请求失败，状态码: {retry_resp.status_code}")
+                                reply_text = "图片处理时间较长，请稍后重试或发送新消息继续对话"
+                        except (httpx.ConnectError, httpx.TimeoutException, Exception) as e:
+                            error_type = type(e).__name__
+                            print(f"[DEBUG] 重试过程出错 ({error_type}): {e}")
+                            if self.debug:
+                                import traceback
+                                traceback.print_exc()
+                            reply_text = "图片处理时间较长，请稍后重试或发送新消息继续对话"
+                        
+                        # 如果仍然无法解析
+                        if reply_text == "无法解析响应":
+                            reply_text = "图片处理时间较长，请稍后重试或发送新消息继续对话"
+                    
+                    # 保存失败响应用于分析
+                    try:
+                        with open("debug_citation_response.txt", "w", encoding="utf-8") as f:
+                            f.write(resp.text)
+                        print(f"[DEBUG] 响应已保存到 debug_citation_response.txt")
+                    except:
+                        pass
+                    
+                    # 如果仍然无法解析，检查是否是知识库响应
+                    if reply_text == "无法解析响应":
+                        # 检查响应中是否有知识库标记 [3]
+                        has_knowledge_base = False
                         try:
                             lines = resp.text.split("\n")
-                            for i, line in enumerate(lines):
+                            for line in lines:
                                 line = line.strip()
                                 if not line or line.startswith(")]}'") or line.isdigit():
                                     continue
@@ -895,25 +1098,33 @@ class GeminiClient:
                                     data = json.loads(line)
                                     if isinstance(data, list) and len(data) > 0 and isinstance(data[0], list):
                                         actual_data = data[0]
-                                        if len(actual_data) >= 3 and actual_data[0] == "wrb.fr" and actual_data[2]:
-                                            inner_json = json.loads(actual_data[2])
-                                            print(f"[DEBUG] 响应结构: inner_json长度={len(inner_json) if inner_json else 0}")
-                                            if inner_json:
-                                                for idx, item in enumerate(inner_json):
-                                                    if item:
-                                                        print(f"[DEBUG] inner_json[{idx}] = {str(item)[:200]}")
-                        except Exception as e:
-                            print(f"[DEBUG] 分析响应结构时出错: {e}")
-                        # 保存失败响应用于分析
-                        try:
-                            with open("debug_citation_response.txt", "w", encoding="utf-8") as f:
-                                f.write(resp.text)
-                            print(f"[DEBUG] 引用内容响应已保存到 debug_citation_response.txt")
+                                        if (len(actual_data) >= 6 and actual_data[0] == "wrb.fr" and 
+                                            actual_data[5] and isinstance(actual_data[5], list) and 
+                                            len(actual_data[5]) > 0 and actual_data[5][0] == 3):
+                                            has_knowledge_base = True
+                                            if self.debug:
+                                                print(f"[DEBUG] 检测到知识库响应标记 [3]")
+                                            break
+                                except:
+                                    continue
                         except:
                             pass
+                        
+                        if has_knowledge_base:
+                            # 知识库响应只有标记，没有内容，这是正常的
+                            # 不返回错误，让知识库功能正常工作
+                            if self.debug:
+                                print(f"[DEBUG] 检测到知识库响应标记 [3]，但 actual_data[2] 为 null，这是正常的")
+                            # 不设置 reply_text，让它保持"无法解析响应"
+                            # 这样知识库功能可以正常工作，不会返回错误的提示
+                        else:
+                            print(f"[DEBUG] 最终检查：未检测到知识库响应，返回无法解析响应")
             
             # 保存助手回复
             self.messages.append(Message(role="assistant", content=reply_text))
+            
+            # 保存会话状态（包括消息历史）
+            self._save_session_state()
             
             # 构建 OpenAI 格式响应
             return ChatCompletionResponse(
@@ -941,12 +1152,82 @@ class GeminiClient:
             self._log_gemini_call(gemini_request_log, "", error=str(e))
             raise Exception(f"请求失败: {e}")
     
+    def _save_session_state(self):
+        """保存会话状态到文件"""
+        try:
+            state = {
+                "conversation_id": self.conversation_id,
+                "response_id": self.response_id,
+                "choice_id": self.choice_id,
+                "messages": [
+                    {"role": m.role, "content": m.content}
+                    for m in self.messages
+                ]
+            }
+            with open(self.session_file, "w", encoding="utf-8") as f:
+                json.dump(state, f, ensure_ascii=False, indent=2)
+            if self.debug:
+                print(f"[DEBUG] 会话状态已保存: conversation_id={self.conversation_id[:20] if self.conversation_id else 'None'}...")
+        except Exception as e:
+            if self.debug:
+                print(f"[DEBUG] 保存会话状态失败: {e}")
+    
+    def _load_session_state(self):
+        """从文件加载会话状态"""
+        try:
+            if not os.path.exists(self.session_file):
+                if self.debug:
+                    print(f"[DEBUG] 会话状态文件不存在，使用新会话")
+                return
+            
+            with open(self.session_file, "r", encoding="utf-8") as f:
+                state = json.load(f)
+            
+            # 恢复会话上下文
+            self.conversation_id = state.get("conversation_id", "")
+            self.response_id = state.get("response_id", "")
+            self.choice_id = state.get("choice_id", "")
+            
+            # 恢复消息历史
+            messages_data = state.get("messages", [])
+            self.messages = [
+                Message(role=msg["role"], content=msg["content"])
+                for msg in messages_data
+            ]
+            
+            # 限制消息历史数量
+            if len(self.messages) > self.max_history_messages:
+                keep_count = self.max_history_messages
+                if keep_count % 2 == 1:
+                    keep_count -= 1
+                self.messages = self.messages[-keep_count:]
+            
+            if self.debug:
+                print(f"[DEBUG] 会话状态已恢复: conversation_id={self.conversation_id[:20] if self.conversation_id else 'None'}..., messages={len(self.messages)}条")
+        except Exception as e:
+            if self.debug:
+                print(f"[DEBUG] 加载会话状态失败: {e}")
+            # 如果加载失败，使用空状态
+            self.conversation_id = ""
+            self.response_id = ""
+            self.choice_id = ""
+            self.messages = []
+    
     def reset(self):
         """重置会话上下文"""
         self.conversation_id = ""
         self.response_id = ""
         self.choice_id = ""
         self.messages = []
+        # 删除会话状态文件
+        try:
+            if os.path.exists(self.session_file):
+                os.remove(self.session_file)
+                if self.debug:
+                    print(f"[DEBUG] 会话状态文件已删除")
+        except Exception as e:
+            if self.debug:
+                print(f"[DEBUG] 删除会话状态文件失败: {e}")
     
     def get_history(self) -> List[Dict]:
         """获取消息历史 (OpenAI 格式)"""
